@@ -85,40 +85,40 @@ class OFMModel:
 
             # rewrite the train_loader, it should be a list
             for batch_pack in train_loader:
-                    
-                batch = batch_pack['input_feat'].to(device) # [batch_size, n_chan, n_seq]
-                pos = batch_pack['input_pos'].to(device) # [batch_size, x_dim, n_seq]
+                
+                batch = batch_pack['input_feat'].to(device)
+                pos = batch_pack['input_pos'].to(device)
                 query_pos = batch_pack['query_pos'].to(device)
-                #supernode_idxs = batch_pack['supernode_idxs'].to(device) # [batch_size*n_super_nodes]
-                #batch_idx = batch_pack['batch_idx'].to(device) # [batch_size*n_seq]
                 
-                #pos = pos[0:1].to(device) # requirment of GINO
-                batch_size = batch.shape[0]
-                    
-                # GP noise with OT reorder
-                x_0, x_data = self.sample_gp_noise(batch)
-        
-                # t ~ Unif[0, 1)
-                t = torch.rand(batch_size, device=device)
-                
+                theta = batch_pack['theta'].to(device)               # NEW
+                group_ids = batch_pack['group_ids'].to(device)       # NEW
+                total_rows = batch.shape[0]
+
+                # Per-group GP noise + OT coupling (paper Eq. 7: pi_theta is per-theta)
+                x_0 = torch.empty_like(batch)
+                x_data = torch.empty_like(batch)
+                for g in group_ids.unique():
+                    mask = (group_ids == g)
+                    x_0_g, x_data_g = self.sample_gp_noise(batch[mask])
+                    x_0[mask] = x_0_g
+                    x_data[mask] = x_data_g
+
+                t = torch.rand(total_rows, device=device)
                 x_t = self.simulate(t, x_0, x_data)
-                # Get conditional vector fields
+                
                 target = self.get_conditional_fields(x_0, x_data)
-
+                
                 x_t = x_t.to(device)
-                target = target.to(device)         
+                target = target.to(device)
 
-                # Get model output
-                #print('t before the model :{}'.format(t))
-                model_out = model(input_feat=x_t, input_pos=pos, query_pos=query_pos, timestep=t)
+                # Pass theta through the forward call
+                model_out = model(input_feat=x_t, input_pos=pos, query_pos=query_pos, timestep=t, theta=theta)            # CHANGED
 
-                # Evaluate loss and do gradient step
-                #print('target:{}, model_out:{}'.format(target.shape, model_out.shape))
                 optimizer.zero_grad()
-                loss = torch.mean((model_out - target)**2 ) 
+                loss = torch.mean((model_out - target)**2)
                 loss.backward()
                 optimizer.step()
-
+                
                 tr_loss += loss.item()
 
             tr_loss /= len(train_loader)

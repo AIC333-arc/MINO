@@ -1,0 +1,17 @@
+python "exp/exp_heston_T.py" \
+    --device 'cuda:0' \
+    --data_path 'data/heston' \
+    --spath 'saved_models/MINO_T_Heston' \
+    --x_dim 2 \
+    --query_dims 16 16 \
+    --co_domain 1 \
+    --radius 0.1 \
+    --theta_dim 5 \
+    --epochs 300 \
+    --B_theta 32 \
+    --M_pairs 32 \
+    --dim 256 \
+    --num_heads 8 \
+    --enc_depth 4 \
+    --dec_depth 4 \
+    --eval 0

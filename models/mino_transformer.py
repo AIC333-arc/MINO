@@ -15,7 +15,8 @@ class MINO(nn.Module):
             input_feat, 
             input_pos,
             query_pos, # fixed
-            timestep=None
+            timestep=None,
+            theta=None
     ):        
         
         x_dim = input_pos.shape[1]
@@ -25,7 +26,10 @@ class MINO(nn.Module):
         if self.conditioner is not None:
             if timestep.dim() == 0 or timestep.numel() == 1:
                 timestep = torch.ones(batch_size, device=timestep.device) * timestep
-            condition = self.conditioner(timestep) # [batch_size, dim*4]
+            if theta is not None:
+                condition = self.conditioner(timestep, theta)
+            else:
+                condition = self.conditioner(timestep)
         else:
             condition = None
 
