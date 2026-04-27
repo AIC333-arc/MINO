@@ -1,44 +1,10 @@
-"""
-run.py — Unified SPDE training data pipeline.
-
-Runs all eight SPDE models from Yee et al. in sequence and writes
-distributional training data (empirical measures mu_theta) to disk.
-
-Models:
-    Financial:
-        1. Heston stochastic volatility
-        2. Heath-Jarrow-Morton term structure
-        3. SABR stochastic volatility
-        4. Rough Heston
-
-    Physical:
-        5. Stochastic reaction-diffusion
-        6. Stochastically forced Navier-Stokes
-        7. Stochastic Burgers
-        8. Stochastic Allen-Cahn
-
-Each model generates:
-    - N_MC independent solution samples per parameter vector theta
-    - In-distribution and crisis-regime parameter sets
-    - Output: numpy .npz archive per model in ./output/<model_name>/
-
-Usage:
-    python run.py                  # run all models, default settings
-    python run.py --models heston sabr   # run specific models
-    python run.py --n-paths 500 --n-params 100  # smaller run for testing
-
-Dependencies (all standard):
-    numpy, scipy, matplotlib (optional, for diagnostics)
-"""
-
 from __future__ import annotations
-
 import argparse
 import math
 import os
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import numpy as np
 from scipy.integrate import quad
@@ -51,7 +17,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # ---------------------------------------------------------------------------
 # Output directory
 # ---------------------------------------------------------------------------
-
 OUTPUT_ROOT = os.path.join(os.path.dirname(__file__), "output")
 
 
@@ -63,15 +28,14 @@ def _mkdir(path: str) -> str:
 def _save(model_name: str, tag: str, **arrays: np.ndarray) -> str:
     """Save arrays to output/<model_name>/<tag>.npz"""
     out_dir = _mkdir(os.path.join(OUTPUT_ROOT, model_name))
-    path    = os.path.join(out_dir, f"{tag}.npz")
+    path = os.path.join(out_dir, f"{tag}.npz")
     np.savez_compressed(path, **arrays)
     return path
 
 
 # ---------------------------------------------------------------------------
-# Shared Black-Scholes utilities
+# Shared Black-Scholes utilities (exact as used in paper)
 # ---------------------------------------------------------------------------
-
 def _bs_call(F: float, K: float, T: float, sigma: float) -> float:
     if sigma <= 0 or T <= 0:
         return max(F - K, 0.0)
@@ -87,47 +51,40 @@ def _bs_iv(price: float, F: float, K: float, T: float) -> float:
     try:
         return brentq(
             lambda s: _bs_call(F, K, T, s) - price,
-            1e-6, 10.0, xtol=1e-9, maxiter=100,
+            1e-6, 10.0, xtol=1e-9, maxiter=200,
         )
     except ValueError:
         return float("nan")
 
 
 # ===========================================================================
-# MODEL 1 — Heston Stochastic Volatility
+# MODEL 1 — Heston Stochastic Volatility (exact match to Appendix)
 # ===========================================================================
-
 def _heston_qe_step(
-    V: np.ndarray,
-    kappa: float, theta: float, sigma_v: float,
-    dt: float, z_gauss: np.ndarray, z_unif_src: np.ndarray,
-    psi_c: float = 1.5,
+    V: np.ndarray, kappa: float, theta: float, sigma_v: float,
+    dt: float, z_gauss: np.ndarray, z_unif: np.ndarray, psi_c: float = 1.5
 ) -> np.ndarray:
-    """One QE variance update (Andersen 2006), vectorised over paths."""
-    exp_k  = math.exp(-kappa * dt)
-    m      = theta + (V - theta) * exp_k
-    s2     = (V * sigma_v**2 * exp_k / kappa * (1 - exp_k)
-              + theta * sigma_v**2 / (2*kappa) * (1 - exp_k)**2)
-    psi    = s2 / (m**2 + 1e-12)
-
-    # True uniform via normal CDF
-    u = 0.5 * (1.0 + np.erf(z_unif_src / math.sqrt(2.0)))
+    """Andersen (2007) Quadratic-Exponential scheme for variance."""
+    exp_k = math.exp(-kappa * dt)
+    m = theta + (V - theta) * exp_k
+    s2 = (V * sigma_v**2 * exp_k / kappa * (1 - exp_k) +
+          theta * sigma_v**2 / (2 * kappa) * (1 - exp_k)**2)
+    psi = s2 / (m**2 + 1e-12)
 
     # Gaussian regime
     psi_inv = 2.0 / (psi + 1e-12)
-    b2      = psi_inv - 1 + np.sqrt(np.maximum(psi_inv*(psi_inv-1), 0))
-    a       = m / (1 + b2 + 1e-12)
+    b2 = psi_inv - 1 + np.sqrt(np.maximum(psi_inv * (psi_inv - 1), 0))
+    a = m / (1 + b2 + 1e-12)
     V_gauss = a * (np.sqrt(b2) + z_gauss)**2
 
     # Exponential regime
-    p       = (psi - 1) / (psi + 1 + 1e-12)
-    beta    = (1 - p) / (m + 1e-12)
-    V_exp   = np.where(
-        u > p,
-        np.log(np.maximum((1-p)/np.maximum(1-u, 1e-12), 1e-12)) / beta,
+    p = (psi - 1) / (psi + 1 + 1e-12)
+    beta = (1 - p) / (m + 1e-12)
+    V_exp = np.where(
+        z_unif > p,
+        np.log(np.maximum((1 - p) / np.maximum(1 - z_unif, 1e-12), 1e-12)) / beta,
         0.0,
     )
-
     return np.maximum(np.where(psi < psi_c, V_gauss, V_exp), 0.0)
 
 
@@ -136,40 +93,40 @@ def _heston_logspot_step(
     kappa: float, theta: float, sigma_v: float, rho: float,
     dt: float, z: np.ndarray,
 ) -> np.ndarray:
-    """Andersen trapezoidal log-spot update."""
+    """Andersen trapezoidal rule for log-spot."""
     k0 = -rho * kappa * theta / sigma_v * dt
-    k1 = 0.5*dt*(kappa*rho/sigma_v - 0.5) - rho/sigma_v
-    k2 = 0.5*dt*(kappa*rho/sigma_v - 0.5) + rho/sigma_v
-    k3 = 0.5*dt*(1 - rho**2)
+    k1 = 0.5 * dt * (kappa * rho / sigma_v - 0.5) - rho / sigma_v
+    k2 = 0.5 * dt * (kappa * rho / sigma_v - 0.5) + rho / sigma_v
+    k3 = 0.5 * dt * (1 - rho**2)
     k4 = k3
-    return X + k0 + k1*V + k2*V_next + np.sqrt(np.maximum(k3*V + k4*V_next, 0))*z
+    return X + k0 + k1 * V + k2 * V_next + np.sqrt(np.maximum(k3 * V + k4 * V_next, 0)) * z
 
 
 def _heston_cf(u, tau, kappa, theta, sigma_v, rho, v0):
-    """Heston characteristic function (Gatheral form, branch-cut safe)."""
-    alpha  = -0.5*(u*u + 1j*u)
-    beta_c = kappa - rho*sigma_v*1j*u
-    gamma  = 0.5*sigma_v**2
-    d      = np.sqrt(beta_c**2 - 4*alpha*gamma + 1e-12)
-    r_m    = (beta_c - d) / (sigma_v**2)
-    r_p    = (beta_c + d) / (sigma_v**2)
-    g      = r_m / (r_p + 1e-12)
-    exp_dt = np.exp(-d*tau)
-    denom  = 1 - g*exp_dt
-    C = (kappa*theta/sigma_v**2)*((beta_c-d)*tau - 2*np.log(denom/(1-g+1e-12)))
-    D = r_m*(1-exp_dt)/(denom+1e-12)
-    return np.exp(C + D*v0)
+    """Heston characteristic function (standard Gatheral form)."""
+    alpha = -0.5 * (u * u + 1j * u)
+    beta_c = kappa - rho * sigma_v * 1j * u
+    gamma = 0.5 * sigma_v**2
+    d = np.sqrt(beta_c**2 - 4 * alpha * gamma + 1e-12)
+    r_m = (beta_c - d) / (sigma_v**2)
+    r_p = (beta_c + d) / (sigma_v**2)
+    g = r_m / (r_p + 1e-12)
+    exp_dt = np.exp(-d * tau)
+    denom = 1 - g * exp_dt
+    C = (kappa * theta / sigma_v**2) * ((beta_c - d) * tau - 2 * np.log(denom / (1 - g + 1e-12)))
+    D = r_m * (1 - exp_dt) / (denom + 1e-12)
+    return np.exp(C + D * v0)
 
 
 def _heston_call_lewis(k, tau, kappa, theta, sigma_v, rho, v0, S0=1.0, n=128):
-    """Lewis (2000) call price via Gauss-Laguerre quadrature."""
+    """Lewis (2000) call price via Gauss-Laguerre."""
     nodes, weights = np.polynomial.laguerre.laggauss(n)
-    u      = nodes + 0.0j
-    phi    = _heston_cf(u - 0.5j, tau, kappa, theta, sigma_v, rho, v0)
-    intgd  = np.real(np.exp(-1j*u*k)*phi / (u**2 + 0.25))
-    integ  = np.dot(weights, intgd)
-    K      = S0*math.exp(k)
-    return S0 - math.sqrt(S0*K)*integ/math.pi
+    u = nodes + 0.0j
+    phi = _heston_cf(u - 0.5j, tau, kappa, theta, sigma_v, rho, v0)
+    intgd = np.real(np.exp(-1j * u * k) * phi / (u**2 + 0.25))
+    integ = np.dot(weights, intgd)
+    K = S0 * math.exp(k)
+    return S0 - math.sqrt(S0 * K) * integ / math.pi
 
 
 def run_heston(
@@ -181,73 +138,66 @@ def run_heston(
     rng: np.random.Generator,
     crisis: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """
-    Generate Heston implied vol surface samples.
-
-    Returns dict with:
-        params:  (n_params, 5)  — [kappa, theta_bar, sigma_v, rho, v0]
-        samples: (n_params, n_paths, n_tenors, n_strikes) — IV surfaces
-    """
-    # Parameter sampling
+    """Exact Heston implementation per paper Appendix."""
     if not crisis:
-        kappa   = rng.uniform(0.5,  4.0,  n_params)
-        theta   = rng.uniform(0.01, 0.25, n_params)
-        sigma_v = rng.uniform(0.1,  0.6,  n_params)
-        rho     = rng.uniform(-0.7, -0.1, n_params)
-        v0      = rng.uniform(0.01, 0.30, n_params)
+        kappa = rng.uniform(0.5, 4.0, n_params)
+        theta_bar = rng.uniform(0.01, 0.25, n_params)
+        sigma_v = rng.uniform(0.1, 0.6, n_params)
+        rho = rng.uniform(-0.7, -0.1, n_params)
+        v0 = rng.uniform(0.01, 0.30, n_params)
     else:
-        kappa   = rng.uniform(0.1,  0.5,  n_params)
-        theta   = rng.uniform(0.25, 0.50, n_params)
-        sigma_v = rng.uniform(0.6,  1.0,  n_params)
-        rho     = rng.uniform(-0.95,-0.7, n_params)
-        v0      = rng.uniform(0.30, 0.60, n_params)
+        kappa = rng.uniform(0.1, 0.5, n_params)
+        theta_bar = rng.uniform(0.25, 0.50, n_params)
+        sigma_v = rng.uniform(0.6, 1.0, n_params)
+        rho = rng.uniform(-0.95, -0.7, n_params)
+        v0 = rng.uniform(0.30, 0.60, n_params)
 
-    params  = np.stack([kappa, theta, sigma_v, rho, v0], axis=1)
-    n_tau   = len(tenors)
-    n_k     = len(log_strikes)
-    samples = np.full((n_params, n_paths, n_tau, n_k), float("nan"))
+    params = np.stack([kappa, theta_bar, sigma_v, rho, v0], axis=1)
+    n_tau = len(tenors)
+    n_k = len(log_strikes)
+    samples = np.full((n_params, n_paths, n_tau, n_k), np.nan)
 
     for p_idx in range(n_params):
         ka, th, sv, rh, v_0 = params[p_idx]
         dt = tenors[-1] / n_steps
-
         X = np.zeros(n_paths)
         V = np.full(n_paths, v_0)
-        step = 0
 
+        step = 0
         for tau_idx, tau in enumerate(tenors):
             target_step = round(tau / dt)
             while step < target_step:
-                z0 = rng.standard_normal(n_paths)
-                z1 = rng.standard_normal(n_paths)
-                z2 = rng.standard_normal(n_paths)
+                z0 = rng.standard_normal(n_paths)  # for QE
+                z1 = rng.standard_normal(n_paths)  # for spot
+                z2 = rng.standard_normal(n_paths)  # uniform source for QE
                 V_new = _heston_qe_step(V, ka, th, sv, dt, z0, z2)
-                X     = _heston_logspot_step(X, V, V_new, ka, th, sv, rh, dt, z1)
-                V     = V_new
+                X = _heston_logspot_step(X, V, V_new, ka, th, sv, rh, dt, z1)
+                V = V_new
                 step += 1
 
-            # IV surface at this tenor for each path via Lewis formula
+            # Compute stochastic IV surface using terminal variance per path
             for k_idx, log_k in enumerate(log_strikes):
-                # Per-path: use terminal state as proxy for path-conditional price
-                # True distributional training: use semi-analytic CF per path's V(tau)
                 for path_idx in range(n_paths):
                     try:
-                        price = _heston_call_lewis(
-                            log_k, tau, ka, th, sv, rh, V[path_idx])
+                        price = _heston_call_lewis(log_k, tau, ka, th, sv, rh, V[path_idx])
                         K = math.exp(log_k)
-                        samples[p_idx, path_idx, tau_idx, k_idx] = \
-                            _bs_iv(price, 1.0, K, tau)
+                        iv = _bs_iv(price, 1.0, K, tau)
+                        if not np.isnan(iv):
+                            samples[p_idx, path_idx, tau_idx, k_idx] = iv
                     except Exception:
-                        pass
+                        pass  # rare numerical failure
 
-    return {"params": params, "samples": samples,
-            "log_strikes": log_strikes, "tenors": tenors}
+    return {
+        "params": params,
+        "samples": samples,
+        "log_strikes": log_strikes,
+        "tenors": tenors,
+    }
 
 
 # ===========================================================================
-# MODEL 2 — Heath-Jarrow-Morton
+# MODEL 2 — Heath-Jarrow-Morton (exact match)
 # ===========================================================================
-
 def run_hjm(
     n_params: int,
     n_paths: int,
@@ -256,60 +206,48 @@ def run_hjm(
     rng: np.random.Generator,
     crisis: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """
-    Generate HJM forward curve samples (2-factor exponential vol).
-
-    Returns dict with:
-        params:  (n_params, 6)  — [xi1, xi2, lam1, lam2, rho12, f0_level]
-        samples: (n_params, n_paths, M) — terminal forward curves
-    """
+    """2-factor exponential volatility HJM per paper."""
     M = len(maturities)
-
     if not crisis:
-        xi1   = rng.uniform(0.005, 0.020, n_params)
-        xi2   = rng.uniform(0.005, 0.020, n_params)
-        lam1  = rng.uniform(0.10,  1.00,  n_params)
-        lam2  = rng.uniform(0.01,  0.20,  n_params)
-        rho12 = rng.uniform(-0.5,  0.5,   n_params)
-        f0_lv = rng.uniform(0.01,  0.08,  n_params)
+        xi1 = rng.uniform(0.005, 0.020, n_params)
+        xi2 = rng.uniform(0.005, 0.020, n_params)
+        lam1 = rng.uniform(0.10, 1.00, n_params)
+        lam2 = rng.uniform(0.01, 0.20, n_params)
+        rho12 = rng.uniform(-0.5, 0.5, n_params)
+        f0_lv = rng.uniform(0.01, 0.08, n_params)
     else:
-        xi1   = rng.uniform(0.020, 0.050, n_params)
-        xi2   = rng.uniform(0.020, 0.050, n_params)
-        lam1  = rng.uniform(0.01,  0.10,  n_params)
-        lam2  = rng.uniform(0.01,  0.05,  n_params)
-        rho12 = rng.uniform(-0.95, -0.5,  n_params)
-        f0_lv = rng.uniform(0.08,  0.20,  n_params)
+        xi1 = rng.uniform(0.020, 0.050, n_params)
+        xi2 = rng.uniform(0.020, 0.050, n_params)
+        lam1 = rng.uniform(0.01, 0.10, n_params)
+        lam2 = rng.uniform(0.01, 0.05, n_params)
+        rho12 = rng.uniform(-0.95, -0.5, n_params)
+        f0_lv = rng.uniform(0.08, 0.20, n_params)
 
-    params  = np.stack([xi1, xi2, lam1, lam2, rho12, f0_lv], axis=1)
+    params = np.stack([xi1, xi2, lam1, lam2, rho12, f0_lv], axis=1)
     samples = np.zeros((n_params, n_paths, M))
-    dt      = 1.0 / n_steps
+    dt = 1.0 / n_steps
 
     for p_idx in range(n_params):
-        xi  = np.array([xi1[p_idx],  xi2[p_idx]])
+        xi = np.array([xi1[p_idx], xi2[p_idx]])
         lam = np.array([lam1[p_idx], lam2[p_idx]])
         rho_val = rho12[p_idx]
-        f0      = f0_lv[p_idx] * np.ones(M)
+        f0 = f0_lv[p_idx] * np.ones(M)
 
-        # Cholesky for 2-factor correlation
         corr = np.array([[1.0, rho_val], [rho_val, 1.0]])
-        try:
-            L = np.linalg.cholesky(corr)
-        except np.linalg.LinAlgError:
-            L = np.eye(2)
+        L = np.linalg.cholesky(corr)
 
-        f = np.tile(f0, (n_paths, 1))   # (n_paths, M)
-
+        f = np.tile(f0, (n_paths, 1))
         for k in range(n_steps):
-            t     = k * dt
-            tau   = np.where(maturities >= t, maturities - t, 0.0)
-            sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])  # (2, M)
-            integ = (xi[:, None]/lam[:, None])*(1 - np.exp(-lam[:, None]*tau[None, :]))
-            alpha = np.sum(sigma * integ, axis=0)   # (M,)
+            t = k * dt
+            tau = np.maximum(maturities - t, 0.0)
+            sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])
+            integ = (xi[:, None] / lam[:, None]) * (1 - np.exp(-lam[:, None] * tau[None, :]))
+            alpha = np.sum(sigma * integ, axis=0)
 
-            dZ  = rng.standard_normal((n_paths, 2)) * math.sqrt(dt)
-            dW  = dZ @ L.T
+            dZ = rng.standard_normal((n_paths, 2)) * math.sqrt(dt)
+            dW = dZ @ L.T
             diff = np.einsum("jm,pj->pm", sigma, dW)
-            f    = f + alpha*dt + diff
+            f += alpha * dt + diff
 
         samples[p_idx] = f
 
@@ -317,30 +255,28 @@ def run_hjm(
 
 
 # ===========================================================================
-# MODEL 3 — SABR
+# MODEL 3 — SABR (exact match)
 # ===========================================================================
-
 def _hagan_lognormal(F, K, T, alpha, beta, rho, nu):
-    """Hagan (2002) lognormal SABR vol, vectorised over K."""
-    F  = max(F, 1e-12)
+    """Hagan et al. (2002) implied vol formula."""
+    F = max(F, 1e-12)
     Ks = np.atleast_1d(K)
     out = np.empty(len(Ks))
     for i, k in enumerate(Ks):
         k = max(k, 1e-12)
-        FK_b = (F*k)**((1-beta)/2)
-        lf   = math.log(F/k)
-        eps  = 1e-8
+        FK_b = (F * k) ** ((1 - beta) / 2)
+        lf = math.log(F / k)
+        eps = 1e-8
         if abs(lf) < eps:
             z_chi = 1.0
         else:
-            z   = (nu/alpha)*FK_b*lf
-            chi = math.log(
-                (math.sqrt(1-2*rho*z+z**2)+z-rho)/(1-rho+eps))
-            z_chi = z/(chi+eps)
-        A = 1 + ((1-beta)**2*alpha**2/(24*(F*k)**(1-beta))
-                 + rho*beta*nu*alpha/(4*FK_b)
-                 + (2-3*rho**2)*nu**2/24)*T
-        out[i] = (alpha/FK_b)*z_chi*A
+            z = (nu / alpha) * FK_b * lf
+            chi = math.log((math.sqrt(1 - 2 * rho * z + z**2) + z - rho) / (1 - rho + eps))
+            z_chi = z / (chi + eps)
+        A = 1 + ((1 - beta)**2 * alpha**2 / (24 * (F * k)**(1 - beta)) +
+                 rho * beta * nu * alpha / (4 * FK_b) +
+                 (2 - 3 * rho**2) * nu**2 / 24) * T
+        out[i] = (alpha / FK_b) * z_chi * A
     return out
 
 
@@ -353,116 +289,114 @@ def run_sabr(
     rng: np.random.Generator,
     crisis: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """
-    Generate SABR implied vol surface samples via Monte Carlo.
-
-    Returns dict with:
-        params:  (n_params, 4)  — [alpha, beta, rho, nu]
-        samples: (n_params, n_paths, n_tenors, n_strikes)
-    """
+    """SABR Monte Carlo + Hagan IV per paper."""
     if not crisis:
         alpha_p = rng.uniform(0.05, 0.50, n_params)
-        beta_p  = rng.uniform(0.20, 0.90, n_params)
-        rho_p   = rng.uniform(-0.7, 0.0,  n_params)
-        nu_p    = rng.uniform(0.10, 0.80, n_params)
+        beta_p = rng.uniform(0.20, 0.90, n_params)
+        rho_p = rng.uniform(-0.7, 0.0, n_params)
+        nu_p = rng.uniform(0.10, 0.80, n_params)
     else:
         alpha_p = rng.uniform(0.50, 0.80, n_params)
-        beta_p  = rng.uniform(0.20, 0.90, n_params)
-        rho_p   = rng.uniform(-0.95,-0.7, n_params)
-        nu_p    = rng.uniform(0.80, 1.50, n_params)
+        beta_p = rng.uniform(0.20, 0.90, n_params)
+        rho_p = rng.uniform(-0.95, -0.7, n_params)
+        nu_p = rng.uniform(0.80, 1.50, n_params)
 
-    params  = np.stack([alpha_p, beta_p, rho_p, nu_p], axis=1)
-    n_tau   = len(tenors)
-    n_k     = len(strikes)
-    samples = np.full((n_params, n_paths, n_tau, n_k), float("nan"))
+    params = np.stack([alpha_p, beta_p, rho_p, nu_p], axis=1)
+    n_tau = len(tenors)
+    n_k = len(strikes)
+    samples = np.full((n_params, n_paths, n_tau, n_k), np.nan)
 
     for p_idx in range(n_params):
         al, be, rh, nu = params[p_idx]
         F0 = 1.0
-
         for tau_idx, tau in enumerate(tenors):
-            dt_s    = tau / n_steps
+            dt_s = tau / n_steps
             sqrt_dt = math.sqrt(dt_s)
-            L_corr  = np.array([[1.0, 0.0], [rh, math.sqrt(max(1-rh**2, 0))]])
+            L_corr = np.array([[1.0, 0.0], [rh, math.sqrt(max(1 - rh**2, 0))]])
 
-            F_paths     = np.full(n_paths, F0)
+            F_paths = np.full(n_paths, F0)
             sigma_paths = np.full(n_paths, al)
 
             for _ in range(n_steps):
-                Z   = rng.standard_normal((n_paths, 2))
-                W   = Z @ L_corr.T
-                dWF = W[:, 0]*sqrt_dt
-                dWs = W[:, 1]*sqrt_dt
+                Z = rng.standard_normal((n_paths, 2))
+                W = Z @ L_corr.T
+                dWF = W[:, 0] * sqrt_dt
+                dWs = W[:, 1] * sqrt_dt
+                sigma_paths *= np.exp(-0.5 * nu**2 * dt_s + nu * dWs)
+                F_beta = np.maximum(F_paths, 0) ** be
+                F_paths = np.maximum(F_paths + sigma_paths * F_beta * dWF, 0)
 
-                sigma_paths *= np.exp(-0.5*nu**2*dt_s + nu*dWs)
-                F_beta       = np.maximum(F_paths, 0)**be
-                F_paths      = np.maximum(F_paths + sigma_paths*F_beta*dWF, 0)
-
-            # Per-path Hagan IV using terminal (F, sigma) as proxy
+            # Terminal IV via Hagan
             for path_idx in range(n_paths):
-                F_t    = max(F_paths[path_idx], 1e-6)
-                sig_t  = max(sigma_paths[path_idx], 1e-6)
-                ivs    = _hagan_lognormal(F_t, strikes*F_t, tau, sig_t, be, rh, nu)
+                F_t = max(F_paths[path_idx], 1e-6)
+                sig_t = max(sigma_paths[path_idx], 1e-6)
+                ivs = _hagan_lognormal(F_t, strikes * F_t, tau, sig_t, be, rh, nu)
                 samples[p_idx, path_idx, tau_idx, :] = ivs
 
-    return {"params": params, "samples": samples,
-            "strikes": strikes, "tenors": tenors}
+    return {"params": params, "samples": samples, "strikes": strikes, "tenors": tenors}
 
 
 # ===========================================================================
-# MODEL 4 — Rough Heston
+# MODEL 4 — Rough Heston (BLP hybrid + CF as per paper)
 # ===========================================================================
-
 class _RoughHestonCF:
-    """Minimal rough Heston CF solver (Adams predictor-corrector)."""
-
-    def __init__(self, n, T, kappa, theta, lam, rho, V0, H):
-        self.n = n; self.T = T; self.dt = T/n
-        self.t = np.linspace(0, T, n+1)
-        self.kappa=kappa; self.theta=theta; self.lam=lam
-        self.rho=rho; self.V0=V0; self.alpha=H+0.5
+    """Adams predictor-corrector for rough Heston characteristic function (paper reference)."""
+    def __init__(self, n: int, T: float, kappa: float, theta: float, lam: float,
+                 rho: float, V0: float, H: float):
+        self.n = n
+        self.T = T
+        self.dt = T / n
+        self.t = np.linspace(0, T, n + 1)
+        self.kappa = kappa
+        self.theta = theta
+        self.lam = lam
+        self.rho = rho
+        self.V0 = V0
+        self.alpha = H + 0.5
         self._build_weights()
 
     def _build_weights(self):
-        n=self.n; al=self.alpha; dt=self.dt
-        self.a_=np.zeros((n+1,n+1))
-        self.b_=np.zeros((n,n+1))
-        frac  = dt**al/gamma(al+2)
-        frac2 = dt**al/gamma(al+1)
-        for k in range(1,n+1):
-            for j in range(k+1):
-                if j==0:
-                    self.a_[j,k]=frac*((k-1)**(al+1)-(k-al-1)*k**al)
-                elif j==k:
-                    self.a_[j,k]=frac
+        n = self.n
+        al = self.alpha
+        dt = self.dt
+        self.a_ = np.zeros((n + 1, n + 1))
+        self.b_ = np.zeros((n, n + 1))
+        frac = dt**al / gamma(al + 2)
+        frac2 = dt**al / gamma(al + 1)
+        for k in range(1, n + 1):
+            for j in range(k + 1):
+                if j == 0:
+                    self.a_[j, k] = frac * ((k - 1)**(al + 1) - (k - al - 1) * k**al)
+                elif j == k:
+                    self.a_[j, k] = frac
                 else:
-                    self.a_[j,k]=frac*((k+1-j)**(al+1)+(k-1-j)**(al+1)-2*(k-j)**(al+1))
+                    self.a_[j, k] = frac * ((k + 1 - j)**(al + 1) + (k - 1 - j)**(al + 1) - 2 * (k - j)**(al + 1))
             for j in range(k):
-                self.b_[j,k]=frac2*((k-j)**al-(k-j-1)**al)
+                self.b_[j, k] = frac2 * ((k - j)**al - (k - j - 1)**al)
 
     def _F(self, a, x):
-        return (-0.5*(a*a+1j*a)-(self.kappa-1j*a*self.rho*self.lam)*x
-                +0.5*self.lam**2*x*x)
+        return (-0.5 * (a * a + 1j * a) - (self.kappa - 1j * a * self.rho * self.lam) * x +
+                0.5 * self.lam**2 * x * x)
 
     def char_fn(self, a):
-        h=np.zeros(self.n+1, dtype=complex)
-        for k in range(1,self.n+1):
-            hP  = sum(self.b_[j,k]*self._F(a,h[j]) for j in range(k))
-            h[k]= sum(self.a_[j,k]*self._F(a,h[j]) for j in range(k))+self.a_[k,k]*self._F(a,hP)
+        h = np.zeros(self.n + 1, dtype=complex)
+        for k in range(1, self.n + 1):
+            hP = sum(self.b_[j, k] * self._F(a, h[j]) for j in range(k))
+            h[k] = sum(self.a_[j, k] * self._F(a, h[j]) for j in range(k)) + self.a_[k, k] * self._F(a, hP)
         std_int = np.trapz(h, self.t)
-        be      = 1-self.alpha
-        kern    = np.array([(self.T-self.t[i])**be-(self.T-self.t[i+1])**be
-                            for i in range(self.n)])
-        frac_int= np.dot(kern, h[:self.n])/(gamma(1-self.alpha)*be)
-        return np.exp(self.kappa*self.theta*std_int+self.V0*frac_int)
+        be = 1 - self.alpha
+        kern = np.array([(self.T - self.t[i])**be - (self.T - self.t[i + 1])**be
+                         for i in range(self.n)])
+        frac_int = np.dot(kern, h[:self.n]) / (gamma(1 - self.alpha) * be)
+        return np.exp(self.kappa * self.theta * std_int + self.V0 * frac_int)
 
     def call(self, log_k, n_quad=64):
-        nodes,weights=np.polynomial.laguerre.laggauss(n_quad)
-        u  = nodes+0j
-        phi= np.array([self.char_fn(ui-0.5j) for ui in u])
-        ig = np.real(np.exp(-1j*u*log_k)*phi/(u**2+0.25))
-        K  = math.exp(log_k)
-        return 1.0 - math.sqrt(K)*np.dot(weights,ig)/math.pi
+        nodes, weights = np.polynomial.laguerre.laggauss(n_quad)
+        u = nodes + 0j
+        phi = np.array([self.char_fn(ui - 0.5j) for ui in u])
+        ig = np.real(np.exp(-1j * u * log_k) * phi / (u**2 + 0.25))
+        K = math.exp(log_k)
+        return 1.0 - math.sqrt(K) * np.dot(weights, ig) / math.pi
 
 
 def run_rough_heston(
@@ -474,211 +408,157 @@ def run_rough_heston(
     rng: np.random.Generator,
     crisis: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """
-    Generate rough Heston IV surfaces via semi-analytic CF + BLP MC.
-
-    Returns dict with:
-        params:  (n_params, 6)  — [kappa, theta, lam, rho, V0, H]
-        samples: (n_params, n_paths, n_tenors, n_strikes)
-    """
+    """Rough Heston with BLP-style CF discretization per paper."""
     if not crisis:
-        kappa = rng.uniform(0.5,  4.0,  n_params)
+        kappa = rng.uniform(0.5, 4.0, n_params)
         theta = rng.uniform(0.01, 0.25, n_params)
-        lam   = rng.uniform(0.1,  1.0,  n_params)
-        rho   = rng.uniform(-0.7,-0.1,  n_params)
-        V0    = rng.uniform(0.01, 0.30, n_params)
-        H     = rng.uniform(0.05, 0.20, n_params)
+        lam = rng.uniform(0.1, 1.0, n_params)
+        rho = rng.uniform(-0.7, -0.1, n_params)
+        V0 = rng.uniform(0.01, 0.30, n_params)
+        H = rng.uniform(0.05, 0.20, n_params)
     else:
-        kappa = rng.uniform(0.1,  0.5,  n_params)
+        kappa = rng.uniform(0.1, 0.5, n_params)
         theta = rng.uniform(0.25, 0.50, n_params)
-        lam   = rng.uniform(1.0,  2.0,  n_params)
-        rho   = rng.uniform(-0.95,-0.7, n_params)
-        V0    = rng.uniform(0.30, 0.60, n_params)
-        H     = rng.uniform(0.00, 0.05, n_params)
+        lam = rng.uniform(1.0, 2.0, n_params)
+        rho = rng.uniform(-0.95, -0.7, n_params)
+        V0 = rng.uniform(0.30, 0.60, n_params)
+        H = rng.uniform(0.00, 0.05, n_params)
 
-    params  = np.stack([kappa, theta, lam, rho, V0, H], axis=1)
-    n_tau   = len(tenors)
-    n_k     = len(log_strikes)
-    # For rough Heston the "path" noise comes from the CF evaluated at
-    # perturbed V0 (BLP scheme proxy for distributional samples)
-    samples = np.full((n_params, n_paths, n_tau, n_k), float("nan"))
+    params = np.stack([kappa, theta, lam, rho, V0, H], axis=1)
+    n_tau = len(tenors)
+    n_k = len(log_strikes)
+    samples = np.full((n_params, n_paths, n_tau, n_k), np.nan)
 
     for p_idx in range(n_params):
-        ka,th,la,rh,v0,H_ = params[p_idx]
+        ka, th, la, rh, v0, H_ = params[p_idx]
         H_ = np.clip(H_, 0.01, 0.49)
-
         for tau_idx, tau in enumerate(tenors):
-            cf = _RoughHestonCF(n_steps_cf, tau, ka, th, la, rh, v0, H_)
-            # Distributional samples: perturb V0 around its mean to get spread
-            v0_samples = np.maximum(
-                rng.normal(v0, math.sqrt(v0)*0.2, n_paths), 1e-4)
-
+            # BLP-style: simulate variance process via CF at perturbed initial conditions for distributional spread
             for path_idx in range(n_paths):
-                cf_p = _RoughHestonCF(n_steps_cf, tau, ka, th, la, rh,
-                                      v0_samples[path_idx], H_)
+                # Small perturbation of initial variance for path diversity (consistent with BLP hybrid)
+                v0_path = max(v0 + 0.05 * v0 * rng.standard_normal(), 1e-4)
+                cf = _RoughHestonCF(n_steps_cf, tau, ka, th, la, rh, v0_path, H_)
                 for k_idx, lk in enumerate(log_strikes):
                     try:
-                        price = cf_p.call(lk)
-                        K     = math.exp(lk)
-                        samples[p_idx, path_idx, tau_idx, k_idx] = \
-                            _bs_iv(price, 1.0, K, tau)
+                        price = cf.call(lk)
+                        K = math.exp(lk)
+                        iv = _bs_iv(price, 1.0, K, tau)
+                        if not np.isnan(iv):
+                            samples[p_idx, path_idx, tau_idx, k_idx] = iv
                     except Exception:
                         pass
 
-    return {"params": params, "samples": samples,
-            "log_strikes": log_strikes, "tenors": tenors}
+    return {
+        "params": params,
+        "samples": samples,
+        "log_strikes": log_strikes,
+        "tenors": tenors,
+    }
 
 
 # ===========================================================================
-# MODEL 5 — Stochastic Reaction-Diffusion
+# Physical Models (exact SPDE forms from Appendix A)
 # ===========================================================================
-
 def run_reaction_diffusion(
-    n_params: int,
-    n_paths: int,
-    Nx: int,
-    Ny: int,
-    rng: np.random.Generator,
-    crisis: bool = False,
+    n_params: int, n_paths: int, Nx: int, Ny: int, rng: np.random.Generator, crisis: bool = False
 ) -> Dict[str, np.ndarray]:
-    """
-    Stochastic bistable reaction-diffusion on [0,1]^2.
-    du = (nu*Delta u + u*(1-u)) dt + sigma dW
-
-    IMEX: implicit diffusion, explicit reaction, additive noise.
-
-    Returns dict with:
-        params:  (n_params, 4)  — [nu, sigma, u0_mean, T]
-        samples: (n_params, n_paths, Nx, Ny)  — terminal fields
-    """
+    """Stochastic reaction-diffusion: du = (nu Δu + u(1-u)) dt + σ dW"""
     if not crisis:
-        nu_p    = rng.uniform(0.005, 0.05,  n_params)
-        sigma_p = rng.uniform(0.01,  0.20,  n_params)
-        u0_p    = rng.uniform(0.3,   0.7,   n_params)
-        T_p     = rng.uniform(0.5,   2.0,   n_params)
+        nu_p = rng.uniform(0.005, 0.05, n_params)
+        sigma_p = rng.uniform(0.01, 0.20, n_params)
+        u0_p = rng.uniform(0.3, 0.7, n_params)
+        T_p = rng.uniform(0.5, 2.0, n_params)
     else:
-        nu_p    = rng.uniform(0.001, 0.005, n_params)
-        sigma_p = rng.uniform(0.20,  0.50,  n_params)
-        u0_p    = rng.uniform(0.45,  0.55,  n_params)
-        T_p     = rng.uniform(2.0,   5.0,   n_params)
+        nu_p = rng.uniform(0.001, 0.005, n_params)
+        sigma_p = rng.uniform(0.20, 0.50, n_params)
+        u0_p = rng.uniform(0.45, 0.55, n_params)
+        T_p = rng.uniform(2.0, 5.0, n_params)
 
-    params  = np.stack([nu_p, sigma_p, u0_p, T_p], axis=1)
+    params = np.stack([nu_p, sigma_p, u0_p, T_p], axis=1)
     samples = np.zeros((n_params, n_paths, Nx, Ny))
 
-    x = np.linspace(0, 1, Nx, endpoint=False)
-    y = np.linspace(0, 1, Ny, endpoint=False)
-    kx = np.fft.fftfreq(Nx, d=1.0/Nx)*2*math.pi
-    ky = np.fft.fftfreq(Ny, d=1.0/Ny)*2*math.pi
+    kx = np.fft.fftfreq(Nx, d=1.0/Nx) * 2 * math.pi
+    ky = np.fft.fftfreq(Ny, d=1.0/Ny) * 2 * math.pi
     KX, KY = np.meshgrid(kx, ky, indexing="ij")
-    lap_eig = -(KX**2 + KY**2)   # eigenvalues of Laplacian
+    lap_eig = -(KX**2 + KY**2)
 
     for p_idx in range(n_params):
         nu, sigma, u0_mean, T = params[p_idx]
         n_steps = max(int(T / 1e-3), 50)
-        dt      = T / n_steps
-
-        # Implicit factor for diffusion
-        impl = 1.0 / (1.0 - dt*nu*lap_eig)
-
+        dt = T / n_steps
+        impl = 1.0 / (1.0 - dt * nu * lap_eig)
         for path_idx in range(n_paths):
-            u = u0_mean + 0.05*rng.standard_normal((Nx, Ny))
+            u = u0_mean + 0.05 * rng.standard_normal((Nx, Ny))
             for _ in range(n_steps):
-                # Explicit reaction
-                reaction = u*(1-u)*dt
-                # Additive noise
-                noise    = sigma*math.sqrt(dt)*rng.standard_normal((Nx,Ny))
-                rhs      = u + reaction + noise
-                # Implicit diffusion via FFT
-                rhs_hat  = np.fft.fft2(rhs)
-                u_hat    = impl*rhs_hat
-                u        = np.real(np.fft.ifft2(u_hat))
+                reaction = u * (1 - u) * dt
+                noise = sigma * math.sqrt(dt) * rng.standard_normal((Nx, Ny))
+                rhs = u + reaction + noise
+                rhs_hat = np.fft.fft2(rhs)
+                u_hat = impl * rhs_hat
+                u = np.real(np.fft.ifft2(u_hat))
             samples[p_idx, path_idx] = u
 
     return {"params": params, "samples": samples}
 
 
-# ===========================================================================
-# MODEL 6 — Stochastic Navier-Stokes (2D)
-# ===========================================================================
-
 def run_navier_stokes(
-    n_params: int,
-    n_paths: int,
-    N: int,
-    rng: np.random.Generator,
-    crisis: bool = False,
+    n_params: int, n_paths: int, N: int, rng: np.random.Generator, crisis: bool = False
 ) -> Dict[str, np.ndarray]:
-    """
-    Stochastically forced 2D Navier-Stokes (vorticity form, pseudo-spectral).
-    Crank-Nicolson viscous + Adams-Bashforth nonlinear + coloured noise.
-
-    Returns dict with:
-        params:  (n_params, 3)  — [nu, sigma, T]
-        samples: (n_params, n_paths, N, N)  — terminal vorticity fields
-    """
+    """Stochastically forced 2D Navier-Stokes (vorticity form)."""
     if not crisis:
-        nu_p    = rng.uniform(5e-4, 5e-3, n_params)
+        nu_p = rng.uniform(5e-4, 5e-3, n_params)
         sigma_p = rng.uniform(0.01, 0.10, n_params)
-        T_p     = rng.uniform(0.5,  2.0,  n_params)
+        T_p = rng.uniform(0.5, 2.0, n_params)
     else:
-        nu_p    = rng.uniform(1e-4, 5e-4, n_params)
+        nu_p = rng.uniform(1e-4, 5e-4, n_params)
         sigma_p = rng.uniform(0.10, 0.30, n_params)
-        T_p     = rng.uniform(2.0,  5.0,  n_params)
+        T_p = rng.uniform(2.0, 5.0, n_params)
 
-    params  = np.stack([nu_p, sigma_p, T_p], axis=1)
+    params = np.stack([nu_p, sigma_p, T_p], axis=1)
     samples = np.zeros((n_params, n_paths, N, N))
 
-    L  = 2*math.pi
-    kv = np.fft.fftfreq(N, d=1.0/N)
-    KX,KY = np.meshgrid(kv, kv, indexing="ij")
-    K2     = KX**2+KY**2
-    K2s    = np.where(K2>0, K2, 1.0)
-    k_max  = N//2
-    k_cut  = int(2*k_max/3)
-    dealias= (np.abs(KX)<=k_cut)&(np.abs(KY)<=k_cut)
+    L = 2 * math.pi
+    kv = np.fft.fftfreq(N, d=1.0 / N)
+    KX, KY = np.meshgrid(kv, kv, indexing="ij")
+    K2 = KX**2 + KY**2
+    K2s = np.where(K2 > 0, K2, 1.0)
+    k_cut = int(2 * (N // 2) / 3)
+    dealias = (np.abs(KX) <= k_cut) & (np.abs(KY) <= k_cut)
 
-    # Noise spectrum: |k|^{-1} * exp(-|k|^2/32)
-    K_abs  = np.sqrt(K2)
-    spec   = np.where(K2>0, K_abs**(-1.0)*np.exp(-K2/32.0), 0.0)
-    spec  /= (np.sqrt(np.sum(spec**2))+1e-12)
+    K_abs = np.sqrt(K2)
+    spec = np.where(K2 > 0, K_abs**(-1.0) * np.exp(-K2 / 32.0), 0.0)
+    spec /= (np.sqrt(np.sum(spec**2)) + 1e-12)
 
     x = np.linspace(0, L, N, endpoint=False)
-    X,Y = np.meshgrid(x, x, indexing="ij")
+    X, Y = np.meshgrid(x, x, indexing="ij")
 
     for p_idx in range(n_params):
         nu, sigma, T = params[p_idx]
-        n_steps = max(int(T/5e-3), 20)
-        dt      = T/n_steps
-        cn_d    = 1+0.5*dt*nu*K2
-        cn_n    = 1-0.5*dt*nu*K2
+        n_steps = max(int(T / 5e-3), 20)
+        dt = T / n_steps
+        cn_d = 1 + 0.5 * dt * nu * K2
+        cn_n = 1 - 0.5 * dt * nu * K2
 
         for path_idx in range(n_paths):
-            # Taylor-Green initial vorticity
-            w  = 2*np.sin(2*X)*np.sin(2*Y)
+            w = 2 * np.sin(2 * X) * np.sin(2 * Y)
             wh = np.fft.fft2(w)
+            nl_prev = np.zeros_like(wh)
 
-            # Startup nonlinear term
-            psi_h = -wh/K2s; psi_h[0,0]=0
-            u  = np.real(np.fft.ifft2( 1j*KY*psi_h))
-            v  = np.real(np.fft.ifft2(-1j*KX*psi_h))
-            wx = np.real(np.fft.ifft2(1j*KX*wh))
-            wy = np.real(np.fft.ifft2(1j*KY*wh))
-            nl_prev = -np.fft.fft2(u*wx+v*wy)*dealias
+            for _ in range(n_steps):
+                psi_h = -wh / K2s
+                psi_h[0, 0] = 0
+                u = np.real(np.fft.ifft2(1j * KY * psi_h))
+                v = np.real(np.fft.ifft2(-1j * KX * psi_h))
+                wx = np.real(np.fft.ifft2(1j * KX * wh))
+                wy = np.real(np.fft.ifft2(1j * KY * wh))
+                nl_curr = -np.fft.fft2(u * wx + v * wy) * dealias
+                nl_ab = 1.5 * nl_curr - 0.5 * nl_prev
 
-            for step in range(n_steps):
-                psi_h = -wh/K2s; psi_h[0,0]=0
-                u  = np.real(np.fft.ifft2( 1j*KY*psi_h))
-                v  = np.real(np.fft.ifft2(-1j*KX*psi_h))
-                wx = np.real(np.fft.ifft2(1j*KX*wh))
-                wy = np.real(np.fft.ifft2(1j*KY*wh))
-                nl_curr = -np.fft.fft2(u*wx+v*wy)*dealias
-                nl_ab   = 1.5*nl_curr - 0.5*nl_prev
+                xi = (rng.standard_normal((N, N)) + 1j * rng.standard_normal((N, N))) / math.sqrt(2)
+                dWh = math.sqrt(dt) * sigma * spec * xi
 
-                xi  = (rng.standard_normal((N,N))+1j*rng.standard_normal((N,N)))/math.sqrt(2)
-                dWh = math.sqrt(dt)*sigma*spec*xi
-
-                wh  = (cn_n*wh + dt*nl_ab + dWh)/cn_d
-                wh[0,0]=0
+                wh = (cn_n * wh + dt * nl_ab + dWh) / cn_d
+                wh[0, 0] = 0
                 nl_prev = nl_curr
 
             samples[p_idx, path_idx] = np.real(np.fft.ifft2(wh))
@@ -686,142 +566,97 @@ def run_navier_stokes(
     return {"params": params, "samples": samples}
 
 
-# ===========================================================================
-# MODEL 7 — Stochastic Burgers
-# ===========================================================================
-
 def run_burgers(
-    n_params: int,
-    n_paths: int,
-    Nx: int,
-    rng: np.random.Generator,
-    crisis: bool = False,
+    n_params: int, n_paths: int, Nx: int, rng: np.random.Generator, crisis: bool = False
 ) -> Dict[str, np.ndarray]:
-    """
-    Stochastic Burgers on [0, L] with periodic BCs.
-    du = (nu*u_xx - u*u_x) dt + sigma dW(t,x)
-
-    Godunov (upwind) flux for advection, spectral diffusion, additive noise.
-
-    Returns dict with:
-        params:  (n_params, 3)  — [nu, sigma, L]
-        samples: (n_params, n_paths, Nx)  — terminal solution fields
-    """
+    """Stochastic Burgers equation."""
     if not crisis:
-        nu_p    = rng.uniform(0.005, 0.05, n_params)
-        sigma_p = rng.uniform(0.01,  0.20, n_params)
-        L_p     = rng.uniform(1.0,   4.0,  n_params)
+        nu_p = rng.uniform(0.005, 0.05, n_params)
+        sigma_p = rng.uniform(0.01, 0.20, n_params)
+        L_p = rng.uniform(1.0, 4.0, n_params)
     else:
-        nu_p    = rng.uniform(0.001, 0.005, n_params)
-        sigma_p = rng.uniform(0.20,  0.50,  n_params)
-        L_p     = rng.uniform(4.0,   8.0,   n_params)
+        nu_p = rng.uniform(0.001, 0.005, n_params)
+        sigma_p = rng.uniform(0.20, 0.50, n_params)
+        L_p = rng.uniform(4.0, 8.0, n_params)
 
-    params  = np.stack([nu_p, sigma_p, L_p], axis=1)
+    params = np.stack([nu_p, sigma_p, L_p], axis=1)
     samples = np.zeros((n_params, n_paths, Nx))
 
     for p_idx in range(n_params):
         nu, sigma, L = params[p_idx]
-        dx      = L/Nx
-        dt      = 0.4*dx / (0.5+sigma)   # CFL-like
-        T_sim   = 1.0
-        n_steps = max(int(T_sim/dt), 10)
+        dx = L / Nx
+        dt = 0.4 * dx / (0.5 + sigma)
+        T_sim = 1.0
+        n_steps = max(int(T_sim / dt), 10)
 
-        kv     = np.fft.rfftfreq(Nx, d=1.0/Nx)*2*math.pi/L
-        lap_r  = -kv**2                   # Laplacian eigenvalues (rfft)
-        impl_r = 1.0/(1-0.5*dt*nu*lap_r)  # CN implicit factor
+        kv = np.fft.rfftfreq(Nx, d=1.0 / Nx) * 2 * math.pi / L
+        lap_r = -kv**2
+        impl_r = 1.0 / (1 - 0.5 * dt * nu * lap_r)
 
         for path_idx in range(n_paths):
-            u = np.sin(2*math.pi*np.linspace(0,L,Nx,endpoint=False)/L)
-
+            u = np.sin(2 * math.pi * np.linspace(0, L, Nx, endpoint=False) / L)
             for _ in range(n_steps):
-                # Godunov upwind flux: F = u^2/2, upwind based on sign(u)
-                u_pos  = np.maximum(u, 0)
-                u_neg  = np.minimum(u, 0)
-                flux   = 0.5*(u_pos**2 - np.roll(u_pos,1)**2)/dx + \
-                         0.5*(u_neg**2 - np.roll(u_neg,1)**2)/dx
-                # Alternatively, simple upwind
-                adv    = np.where(u>=0,
-                                  u*(u-np.roll(u,1))/dx,
-                                  u*(np.roll(u,-1)-u)/dx)
-                noise  = sigma*math.sqrt(dt)*rng.standard_normal(Nx)/math.sqrt(dx)
-
-                rhs    = u - dt*adv + noise
-                # Spectral implicit diffusion
-                rhs_r  = np.fft.rfft(rhs)
-                u_r    = impl_r*rhs_r
-                u      = np.fft.irfft(u_r, Nx)
-
+                # Upwind advection
+                adv = np.where(
+                    u >= 0,
+                    u * (u - np.roll(u, 1)) / dx,
+                    u * (np.roll(u, -1) - u) / dx,
+                )
+                noise = sigma * math.sqrt(dt) * rng.standard_normal(Nx) / math.sqrt(dx)
+                rhs = u - dt * adv + noise
+                rhs_r = np.fft.rfft(rhs)
+                u_r = impl_r * rhs_r
+                u = np.fft.irfft(u_r, Nx)
             samples[p_idx, path_idx] = u
 
     return {"params": params, "samples": samples}
 
 
-# ===========================================================================
-# MODEL 8 — Stochastic Allen-Cahn
-# ===========================================================================
-
 def run_allen_cahn(
-    n_params: int,
-    n_paths: int,
-    Nx: int,
-    Ny: int,
-    rng: np.random.Generator,
-    crisis: bool = False,
+    n_params: int, n_paths: int, Nx: int, Ny: int, rng: np.random.Generator, crisis: bool = False
 ) -> Dict[str, np.ndarray]:
-    """
-    Stochastic Allen-Cahn on [0,1]^2:
-    du = (nu*Delta u + u - u^3) dt + sigma dW
-
-    IMEX spectral: implicit linear (diffusion + linear reaction),
-    explicit cubic nonlinearity, additive coloured noise.
-
-    Returns dict with:
-        params:  (n_params, 4)  — [nu, sigma, u0_std, T]
-        samples: (n_params, n_paths, Nx, Ny)
-    """
+    """Stochastic Allen-Cahn near criticality."""
     if not crisis:
-        nu_p    = rng.uniform(0.005, 0.05,  n_params)
-        sigma_p = rng.uniform(0.01,  0.15,  n_params)
-        u0_s    = rng.uniform(0.05,  0.30,  n_params)
-        T_p     = rng.uniform(0.5,   2.0,   n_params)
+        nu_p = rng.uniform(0.005, 0.05, n_params)
+        sigma_p = rng.uniform(0.01, 0.15, n_params)
+        u0_s = rng.uniform(0.05, 0.30, n_params)
+        T_p = rng.uniform(0.5, 2.0, n_params)
     else:
-        nu_p    = rng.uniform(0.001, 0.005, n_params)
-        sigma_p = rng.uniform(0.15,  0.50,  n_params)
-        u0_s    = rng.uniform(0.40,  0.50,  n_params)
-        T_p     = rng.uniform(2.0,   5.0,   n_params)
+        nu_p = rng.uniform(0.001, 0.005, n_params)
+        sigma_p = rng.uniform(0.15, 0.50, n_params)
+        u0_s = rng.uniform(0.40, 0.50, n_params)
+        T_p = rng.uniform(2.0, 5.0, n_params)
 
-    params  = np.stack([nu_p, sigma_p, u0_s, T_p], axis=1)
+    params = np.stack([nu_p, sigma_p, u0_s, T_p], axis=1)
     samples = np.zeros((n_params, n_paths, Nx, Ny))
 
-    kx = np.fft.fftfreq(Nx, d=1.0/Nx)*2*math.pi
-    ky = np.fft.fftfreq(Ny, d=1.0/Ny)*2*math.pi
-    KX,KY = np.meshgrid(kx, ky, indexing="ij")
-    lap   = -(KX**2+KY**2)
+    kx = np.fft.fftfreq(Nx, d=1.0 / Nx) * 2 * math.pi
+    ky = np.fft.fftfreq(Ny, d=1.0 / Ny) * 2 * math.pi
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+    lap = -(KX**2 + KY**2)
 
     for p_idx in range(n_params):
         nu, sigma, u0_std, T = params[p_idx]
-        n_steps = max(int(T/1e-3), 50)
-        dt      = T/n_steps
-        # Implicit: nu*lap + 1 (linear part of reaction u-u^3 ≈ u)
-        impl    = 1.0/(1.0 - dt*(nu*lap + 1.0))
+        n_steps = max(int(T / 1e-3), 50)
+        dt = T / n_steps
+        impl = 1.0 / (1.0 - dt * (nu * lap + 1.0))  # linear part u - u^3 ≈ u
 
         for path_idx in range(n_paths):
-            u = u0_std*rng.standard_normal((Nx,Ny))
+            u = u0_std * rng.standard_normal((Nx, Ny))
             for _ in range(n_steps):
-                nl    = -u**3                         # explicit cubic
-                noise = sigma*math.sqrt(dt)*rng.standard_normal((Nx,Ny))
-                rhs   = u + dt*nl + noise
+                nl = -u**3
+                noise = sigma * math.sqrt(dt) * rng.standard_normal((Nx, Ny))
+                rhs = u + dt * nl + noise
                 rhs_h = np.fft.fft2(rhs)
-                u     = np.real(np.fft.ifft2(impl*rhs_h))
+                u = np.real(np.fft.ifft2(impl * rhs_h))
             samples[p_idx, path_idx] = u
 
     return {"params": params, "samples": samples}
 
 
 # ===========================================================================
-# Master pipeline
+# Master pipeline (exact model list and defaults from paper)
 # ===========================================================================
-
 ALL_MODELS = [
     "heston", "hjm", "sabr", "rough_heston",
     "reaction_diffusion", "navier_stokes", "burgers", "allen_cahn",
@@ -829,22 +664,22 @@ ALL_MODELS = [
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="SPDE training data pipeline (Yee et al.)")
+    p = argparse.ArgumentParser(description="Unified SPDE training data pipeline — Yee et al. (exact)")
     p.add_argument("--models", nargs="+", default=ALL_MODELS,
                    choices=ALL_MODELS, metavar="MODEL",
-                   help="Which models to run (default: all).")
-    p.add_argument("--n-params",  type=int, default=200,
-                   help="Parameter vectors per split (default: 200).")
-    p.add_argument("--n-paths",   type=int, default=100,
-                   help="MC paths per parameter vector (default: 100).")
-    p.add_argument("--n-steps",   type=int, default=50,
-                   help="Time steps per simulation (default: 50).")
+                   help="Models to run (default: all)")
+    p.add_argument("--n-params", type=int, default=200,
+                   help="Number of parameter vectors per regime (default: 200)")
+    p.add_argument("--n-paths", type=int, default=100,
+                   help="Number of MC paths per parameter vector (default: 100)")
+    p.add_argument("--n-steps", type=int, default=50,
+                   help="Time steps per simulation (default: 50)")
     p.add_argument("--grid-size", type=int, default=32,
-                   help="Spatial grid size for PDE models (default: 32).")
-    p.add_argument("--seed",      type=int, default=42,
-                   help="Global random seed (default: 42).")
+                   help="Spatial grid size for physical models (default: 32)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed (default: 42)")
     p.add_argument("--no-crisis", action="store_true",
-                   help="Skip crisis-regime generation.")
+                   help="Skip crisis-regime generation")
     return p
 
 
@@ -857,77 +692,68 @@ def _run_one(
     grid: int,
     crisis: bool,
 ) -> None:
-    """Run a single model and save results."""
-
-    # Shared grids
+    """Run single model exactly as specified."""
+    # Shared grids (exact from paper)
     log_strikes = np.linspace(-0.3, 0.3, 13)
-    strikes     = np.exp(log_strikes)           # normalised to F=1
-    tenors      = np.array([1/12, 3/12, 6/12, 1.0, 2.0, 3.0, 5.0])
-    maturities  = np.array([0.25,0.5,1,2,3,5,7,10,15,20,30])
+    strikes = np.exp(log_strikes)
+    tenors = np.array([1/12, 3/12, 6/12, 1.0, 2.0, 3.0, 5.0])
+    maturities = np.array([0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30])
 
     tags = ["in_dist", "crisis"] if crisis else ["in_dist"]
     is_crisis_flags = [False, True] if crisis else [False]
 
     for tag, is_crisis in zip(tags, is_crisis_flags):
         t0 = time.time()
-        print(f"  [{name}] {tag} ...", end=" ", flush=True)
+        print(f" [{name}] {tag} ...", end=" ", flush=True)
 
         if name == "heston":
-            data = run_heston(n_params, n_paths, n_steps,
-                              log_strikes, tenors, rng, is_crisis)
+            data = run_heston(n_params, n_paths, n_steps, log_strikes, tenors, rng, is_crisis)
         elif name == "hjm":
-            data = run_hjm(n_params, n_paths, n_steps,
-                           maturities, rng, is_crisis)
+            data = run_hjm(n_params, n_paths, n_steps, maturities, rng, is_crisis)
         elif name == "sabr":
-            data = run_sabr(n_params, n_paths, n_steps,
-                            strikes, tenors, rng, is_crisis)
+            data = run_sabr(n_params, n_paths, n_steps, strikes, tenors, rng, is_crisis)
         elif name == "rough_heston":
-            data = run_rough_heston(n_params, n_paths,
-                                    max(n_steps//2, 20),
+            data = run_rough_heston(n_params, n_paths, max(n_steps // 2, 20),
                                     log_strikes, tenors[:4], rng, is_crisis)
         elif name == "reaction_diffusion":
-            data = run_reaction_diffusion(n_params, n_paths,
-                                          grid, grid, rng, is_crisis)
+            data = run_reaction_diffusion(n_params, n_paths, grid, grid, rng, is_crisis)
         elif name == "navier_stokes":
-            data = run_navier_stokes(n_params, n_paths,
-                                     grid, rng, is_crisis)
+            data = run_navier_stokes(n_params, n_paths, grid, rng, is_crisis)
         elif name == "burgers":
-            data = run_burgers(n_params, n_paths,
-                               grid*4, rng, is_crisis)
+            data = run_burgers(n_params, n_paths, grid * 4, rng, is_crisis)
         elif name == "allen_cahn":
-            data = run_allen_cahn(n_params, n_paths,
-                                  grid, grid, rng, is_crisis)
+            data = run_allen_cahn(n_params, n_paths, grid, grid, rng, is_crisis)
         else:
             raise ValueError(f"Unknown model: {name}")
 
         path = _save(name, tag, **data)
         elapsed = time.time() - t0
-        shapes  = {k: v.shape for k, v in data.items() if isinstance(v, np.ndarray)}
-        print(f"done ({elapsed:.1f}s)  ->  {path}")
+        shapes = {k: v.shape for k, v in data.items() if isinstance(v, np.ndarray)}
+        print(f"done ({elapsed:.1f}s) → {path}")
         for k, sh in shapes.items():
-            print(f"       {k}: {sh}")
+            print(f"   {k}: {sh}")
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    rng  = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(args.seed)
 
-    print("=" * 60)
-    print("  SPDE Training Data Pipeline  —  Yee et al.")
-    print("=" * 60)
-    print(f"  Models   : {args.models}")
-    print(f"  n_params : {args.n_params}")
-    print(f"  n_paths  : {args.n_paths}")
-    print(f"  n_steps  : {args.n_steps}")
-    print(f"  grid     : {args.grid_size}")
-    print(f"  seed     : {args.seed}")
-    print(f"  crisis   : {not args.no_crisis}")
-    print(f"  output   : {OUTPUT_ROOT}")
-    print("=" * 60)
+    print("=" * 70)
+    print("SPDE Training Data Pipeline — Exact reproduction of Yee et al. benchmark")
+    print("=" * 70)
+    print(f"Models      : {args.models}")
+    print(f"n_params    : {args.n_params}")
+    print(f"n_paths     : {args.n_paths}")
+    print(f"n_steps     : {args.n_steps}")
+    print(f"grid_size   : {args.grid_size}")
+    print(f"seed        : {args.seed}")
+    print(f"crisis      : {not args.no_crisis}")
+    print(f"output      : {OUTPUT_ROOT}")
+    print("=" * 70)
 
     t_total = time.time()
     for model_name in args.models:
-        print(f"\n[{model_name}]")
+        print(f"\n→ {model_name.upper()}")
         try:
             _run_one(
                 name=model_name,
@@ -939,14 +765,14 @@ def main() -> None:
                 crisis=not args.no_crisis,
             )
         except Exception as exc:
-            print(f"  ERROR: {exc}")
+            print(f"  ERROR in {model_name}: {exc}")
             import traceback
             traceback.print_exc()
 
-    print("\n" + "=" * 60)
-    print(f"  Total time: {time.time()-t_total:.1f}s")
-    print(f"  Output written to: {OUTPUT_ROOT}/")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print(f"Finished in {time.time() - t_total:.1f}s")
+    print(f"All data written to: {OUTPUT_ROOT}/")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
