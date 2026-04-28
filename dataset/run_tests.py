@@ -58,7 +58,6 @@ def _bs_iv(price: float, F: float, K: float, T: float) -> float:
     # i assume this is a methodfor solving the optimal theta or implied volatility for realistic market conditions.
     # finding the optimal sigma that is as realistic as possible
     # and i assume this has a closed form solution whatever right.
-    # i have no clue what the other parameters of this lambda function are.
     except ValueError:
         return float("nan")
 
