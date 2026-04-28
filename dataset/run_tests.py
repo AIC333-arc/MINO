@@ -309,14 +309,14 @@ def run_hjm(
         lam1  = rng.uniform(0.10,  1.00,  n_params) # speed at which volatility decays
         lam2  = rng.uniform(0.01,  0.20,  n_params) # speed at which volatility decays
         rho12 = rng.uniform(-0.5,  0.5,   n_params) # correlation coefficient
-        f0_lv = rng.uniform(0.01,  0.08,  n_params) # initial forward curve *check*
+        f0_lv = rng.uniform(0.01,  0.08,  n_params) # level of initial forward curve (i.e., f(0, T) at short end)
     else:
         xi1   = rng.uniform(0.020, 0.050, n_params) # constant volatility coefficient
         xi2   = rng.uniform(0.020, 0.050, n_params) # constant volatility coefficient
         lam1  = rng.uniform(0.01,  0.10,  n_params) # speed at which volatility decays
         lam2  = rng.uniform(0.01,  0.05,  n_params) # speed at which volatility decays
         rho12 = rng.uniform(-0.95, -0.5,  n_params) # correlation coefficient
-        f0_lv = rng.uniform(0.08,  0.20,  n_params) # initial forward rate curve velocity *check*
+        f0_lv = rng.uniform(0.08,  0.20,  n_params) # level of initial forward curve (i.e., f(0, T) at short end)
 
     params  = np.stack([xi1, xi2, lam1, lam2, rho12, f0_lv], axis=1)
     samples = np.zeros((n_params, n_paths, M))
@@ -329,12 +329,14 @@ def run_hjm(
 
         # Initial forward curve: flat level + optional upward slope
         f0 = f0_lv[p_idx] + f0_slope * maturities      # (M,)
-        # f0_1v *  rho12 + f0_slope
-        
+        # f0_1v *  rho12 + f0_slope * maturities
 
         # Correlation matrix R and its Cholesky factor L (dW = L @ dZ)
         rho_c = float(np.clip(rho_val, -1.0 + 1e-7, 1.0 - 1e-7))
+        # clip between (-1,1)
         R     = np.array([[1.0, rho_c], [rho_c, 1.0]])
+        # R is a square matrix with a Cholesky decomposition
+        
         try:
             L = np.linalg.cholesky(R)
         except np.linalg.LinAlgError:
@@ -347,7 +349,7 @@ def run_hjm(
 
             # FIX 2: zero expired maturities so their rates stop evolving
             active = maturities > t                          # (M,) bool
-            tau    = np.where(active, maturities - t, 0.0)  # (M,)
+            tau    = np.where(active, maturities - t, 0.0)   # (M,)
 
             sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])  # (2, M)
             sigma[:, ~active] = 0.0
@@ -373,7 +375,18 @@ def run_hjm(
 # MODEL 3 — SABR (exact match)
 # ===========================================================================
 def _hagan_lognormal(F, K, T, alpha, beta, rho, nu):
-    """Hagan et al. (2002) implied vol formula."""
+    """Hagan et al. (2002) implied vol formula.
+    
+    Args:
+        F:             Volatility of the forward
+        K:             Strike price
+        T:             Time to maturity
+        alpha:         Initial Volatility
+        beta:          CEV exponent
+        rho:           Correlation
+        nu:            Volvol
+    """
+    
     F = max(F, 1e-12)
     Ks = np.atleast_1d(K)
     out = np.empty(len(Ks))
@@ -393,7 +406,6 @@ def _hagan_lognormal(F, K, T, alpha, beta, rho, nu):
                  (2 - 3 * rho**2) * nu**2 / 24) * T
         out[i] = (alpha / FK_b) * z_chi * A
     return out
-
 
 def run_sabr(
     n_params: int,
