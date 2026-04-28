@@ -148,7 +148,7 @@ def _heston_cf(u, tau, kappa, theta, sigma_v, rho, v0):
         sigma_v:       Vol-of-vol
         rho:           Correlation between spot and variance Brownians.
         v0:            Initial volility
-        tau:            
+        tau:           *check*
         u:             sample points (nodes) *check*
     """
     alpha = -0.5 * (u * u + 1j * u)
