@@ -40,9 +40,10 @@ def _bs_call(F: float, K: float, T: float, sigma: float) -> float:
     if sigma <= 0 or T <= 0:
         return max(F - K, 0.0)
     d1 = (math.log(max(F / K, 1e-12)) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
+    # missing r - idk what htat is 
     d2 = d1 - sigma * math.sqrt(T)
     return F * norm.cdf(d1) - K * norm.cdf(d2)
-
+    # it's missing e^(-rt) which I asusme is missing because r wasn't included in d1
 
 def _bs_iv(price: float, F: float, K: float, T: float) -> float:
     intrinsic = max(F - K, 0.0)
@@ -53,9 +54,13 @@ def _bs_iv(price: float, F: float, K: float, T: float) -> float:
             lambda s: _bs_call(F, K, T, s) - price,
             1e-6, 10.0, xtol=1e-9, maxiter=200,
         )
+    # what brentrq solves for is the root. what we are solving for here is f(sigma) - price = 0.
+    # i assume this is a methodfor solving the optimal theta or implied volatility for realistic market conditions.
+    # finding the optimal sigma that is as realistic as possible
+    # and i assume this has a closed form solution whatever right.
+    # i have no clue what the other parameters of this lambda function are.
     except ValueError:
         return float("nan")
-
 
 # ===========================================================================
 # MODEL 1 — Heston Stochastic Volatility (exact match to Appendix)
@@ -64,26 +69,41 @@ def _heston_qe_step(
     V: np.ndarray, kappa: float, theta: float, sigma_v: float,
     dt: float, z_gauss: np.ndarray, z_unif: np.ndarray, psi_c: float = 1.5
 ) -> np.ndarray:
-    """Andersen (2007) Quadratic-Exponential scheme for variance."""
+    """Andersen (2007) Quadratic-Exponential scheme for variance.
+    
+    Args:
+        V:             Variance
+        kappa:         Mean-reversion speed.
+        theta:         Long-run variance.
+        sigma_v:       Vol-of-vol
+        dt:            Timestep
+        z_gauss:       Simulate the variance + update asset price
+        z_uniform:     Uniform normal for switch between high-variance (quadriatic guassian) and low-variance (exponential) regimes
+        psi_c:         Swithc between quadriatic approximation adn an exponential approximation
+    """
+    
     exp_k = math.exp(-kappa * dt)
     m = theta + (V - theta) * exp_k
     s2 = (V * sigma_v**2 * exp_k / kappa * (1 - exp_k) +
           theta * sigma_v**2 / (2 * kappa) * (1 - exp_k)**2)
+    # check V[t-1] - I think ts is vectorized
     psi = s2 / (m**2 + 1e-12)
 
-    # Gaussian regime
+    # Gaussian regime (psi <= psiC)
     psi_inv = 2.0 / (psi + 1e-12)
     b2 = psi_inv - 1 + np.sqrt(np.maximum(psi_inv * (psi_inv - 1), 0))
+    # check if it's avoiding negatives
+    # check if it is psi_inv or 2/psi_inv
     a = m / (1 + b2 + 1e-12)
     V_gauss = a * (np.sqrt(b2) + z_gauss)**2
 
-    # Exponential regime
+    # Exponential regime (psi > psiC)
     p = (psi - 1) / (psi + 1 + 1e-12)
     beta = (1 - p) / (m + 1e-12)
     V_exp = np.where(
-        z_unif > p,
+        z_unif > p, # check if it is z_unif <=p
         np.log(np.maximum((1 - p) / np.maximum(1 - z_unif, 1e-12), 1e-12)) / beta,
-        0.0,
+        0.0, # where function is a little different
     )
     return np.maximum(np.where(psi < psi_c, V_gauss, V_exp), 0.0)
 
@@ -93,17 +113,44 @@ def _heston_logspot_step(
     kappa: float, theta: float, sigma_v: float, rho: float,
     dt: float, z: np.ndarray,
 ) -> np.ndarray:
-    """Andersen trapezoidal rule for log-spot."""
+    """Andersen trapezoidal rule for log-spot.
+    
+      Args:
+        X:             Simulated stock price
+        V:             Simulated Variance
+        V_next:        Next value of Variance (check phrasing)
+        kappa:         Mean-reversion speed.
+        theta:         Long-run variance.
+        sigma_v:       Vol-of-vol
+        rho:           Correlation between spot and variance Brownians.
+        dt:            Timestep
+
+      Missing thingy:
+        q: dividend yield (see line 139)
+    """
+    
     k0 = -rho * kappa * theta / sigma_v * dt
     k1 = 0.5 * dt * (kappa * rho / sigma_v - 0.5) - rho / sigma_v
+    # technically takes parameter gamma for k1 and k2 (set to 0.5 --> 0.5*dt)
     k2 = 0.5 * dt * (kappa * rho / sigma_v - 0.5) + rho / sigma_v
     k3 = 0.5 * dt * (1 - rho**2)
     k4 = k3
-    return X + k0 + k1 * V + k2 * V_next + np.sqrt(np.maximum(k3 * V + k4 * V_next, 0)) * z
+    # technically should be two parameters for k3 and k4 --> gamma1 and gamma2, but both are equal to each other
+    return X + k0 + k1 * V + k2 * V_next + np.sqrt(np.maximum(k3 * V + k4 * V_next, 0)) * z # check if this is missing (rho - q) 
 
 
 def _heston_cf(u, tau, kappa, theta, sigma_v, rho, v0):
-    """Heston characteristic function (standard Gatheral form)."""
+    """Heston characteristic function (standard Gatheral form).
+    
+    Args:
+        kappa:         Mean-reversion speed.
+        theta:         Long-run variance.
+        sigma_v:       Vol-of-vol
+        rho:           Correlation between spot and variance Brownians.
+        v0:            Initial volility
+        tau:            
+        u:             sample points (nodes) *check*
+    """
     alpha = -0.5 * (u * u + 1j * u)
     beta_c = kappa - rho * sigma_v * 1j * u
     gamma = 0.5 * sigma_v**2
@@ -114,21 +161,41 @@ def _heston_cf(u, tau, kappa, theta, sigma_v, rho, v0):
     exp_dt = np.exp(-d * tau)
     denom = 1 - g * exp_dt
     C = (kappa * theta / sigma_v**2) * ((beta_c - d) * tau - 2 * np.log(denom / (1 - g + 1e-12)))
+    # There is an addiitonal theta parameter for some reason in our thingy. it's also a little differnet
+    # than the C(u, tau) solution proposed here: https://quant.stackexchange.com/questions/7048/other-means-of-calibrating-heston-models
     D = r_m * (1 - exp_dt) / (denom + 1e-12)
     return np.exp(C + D * v0)
 
 
 def _heston_call_lewis(k, tau, kappa, theta, sigma_v, rho, v0, S0=1.0, n=128):
-    """Lewis (2000) call price via Gauss-Laguerre."""
+    """Lewis (2000) call price via Gauss-Laguerre.
+
+    Args:
+        k:             *Check this*   
+        kappa:         Mean-reversion speed.
+        theta:         Long-run variance.
+        sigma_v:       Vol-of-vol
+        rho:           Correlation between spot and variance Brownians.
+        v0:            Initial variance
+        S0:            Initial price
+        n:             Degere of Laguerre polynomial
+    """
     nodes, weights = np.polynomial.laguerre.laggauss(n)
     u = nodes + 0.0j
     phi = _heston_cf(u - 0.5j, tau, kappa, theta, sigma_v, rho, v0)
+    # subtrct by 0.5j for damping factor; it's a little bit different in the paper
+    # because it's defined as 1/2 + ix rather than x - 0.5i
     intgd = np.real(np.exp(-1j * u * k) * phi / (u**2 + 0.25))
     integ = np.dot(weights, intgd)
+    # this is good - check if dot product is fine here (if not use inner product)
     K = S0 * math.exp(k)
     return S0 - math.sqrt(S0 * K) * integ / math.pi
+    # like everything is fine but it should be
+    # S0e^(-rt) - e^(k/2)*integ/π - but the thing is is that like S0 might be equal to S0exp(-rt)
+    # So it just depends on what exactly S0 is equal to in the context of the solver.
 
 
+# Brandon can we verify this
 def run_heston(
     n_params: int,
     n_paths: int,
@@ -140,18 +207,21 @@ def run_heston(
 ) -> Dict[str, np.ndarray]:
     """Exact Heston implementation per paper Appendix."""
     if not crisis:
+        # Just check the parameters/justify choices
         kappa = rng.uniform(0.5, 4.0, n_params)
         theta_bar = rng.uniform(0.01, 0.25, n_params)
         sigma_v = rng.uniform(0.1, 0.6, n_params)
         rho = rng.uniform(-0.7, -0.1, n_params)
         v0 = rng.uniform(0.01, 0.30, n_params)
     else:
+        # just check parameters/jsutify choices
         kappa = rng.uniform(0.1, 0.5, n_params)
         theta_bar = rng.uniform(0.25, 0.50, n_params)
         sigma_v = rng.uniform(0.6, 1.0, n_params)
         rho = rng.uniform(-0.95, -0.7, n_params)
         v0 = rng.uniform(0.30, 0.60, n_params)
 
+    
     params = np.stack([kappa, theta_bar, sigma_v, rho, v0], axis=1)
     n_tau = len(tenors)
     n_k = len(log_strikes)
@@ -196,7 +266,7 @@ def run_heston(
 
 
 # ===========================================================================
-# MODEL 2 — Heath-Jarrow-Morton (exact match)
+# MODEL 2 — Heath-Jarrow-Morton
 # ===========================================================================
 def run_hjm(
     n_params: int,
@@ -205,49 +275,94 @@ def run_hjm(
     maturities: np.ndarray,
     rng: np.random.Generator,
     crisis: bool = False,
+    f0_slope: float = 0.0,
+    n_factors: int = 2,
 ) -> Dict[str, np.ndarray]:
-    """2-factor exponential volatility HJM per paper."""
-    M = len(maturities)
-    if not crisis:
-        xi1 = rng.uniform(0.005, 0.020, n_params)
-        xi2 = rng.uniform(0.005, 0.020, n_params)
-        lam1 = rng.uniform(0.10, 1.00, n_params)
-        lam2 = rng.uniform(0.01, 0.20, n_params)
-        rho12 = rng.uniform(-0.5, 0.5, n_params)
-        f0_lv = rng.uniform(0.01, 0.08, n_params)
-    else:
-        xi1 = rng.uniform(0.020, 0.050, n_params)
-        xi2 = rng.uniform(0.020, 0.050, n_params)
-        lam1 = rng.uniform(0.01, 0.10, n_params)
-        lam2 = rng.uniform(0.01, 0.05, n_params)
-        rho12 = rng.uniform(-0.95, -0.5, n_params)
-        f0_lv = rng.uniform(0.08, 0.20, n_params)
+    """2-factor exponential volatility HJM per paper.
 
-    params = np.stack([xi1, xi2, lam1, lam2, rho12, f0_lv], axis=1)
+    Fixes vs original:
+
+    1. DRIFT: the correct no-arbitrage drift for correlated factors is
+           alpha(t,T) = sum_{j,k} R[j,k] * sigma_j(t,T) * integral_t^T sigma_k(t,s) ds
+       The original np.sum(sigma * integ, axis=0) is the R=I diagonal-only
+       form; it omits the cross terms rho12*(sigma_1*integ_2 + sigma_2*integ_1).
+       For crisis rho12 near -1 and 30Y tenor the error is ~150bps.
+       Fixed with np.einsum("jm,jk,km->m", sigma, R, integ).
+
+    2. EXPIRED MATURITIES: once t > T_i the original np.maximum(mat-t, 0)
+       kept tau=0 but sigma stayed at xi_j (no decay) and alpha stayed
+       nonzero. Now active = maturities > t, and sigma/integ are explicitly
+       zeroed for ~active columns so expired rates stop evolving.
+
+    3. NEW ARGS:
+       f0_slope: gives a sloped initial curve f(0,T) = f0_level + slope*T.
+       n_factors: forward-compatibility placeholder (only 2 implemented).
+    """
+    if n_factors != 2:
+        raise ValueError("Only n_factors=2 is currently implemented.")
+
+    M = len(maturities)
+
+    if not crisis:
+        xi1   = rng.uniform(0.005, 0.020, n_params) # constant volatility coefficient
+        xi2   = rng.uniform(0.005, 0.020, n_params) # constant volatility coefficient
+        lam1  = rng.uniform(0.10,  1.00,  n_params) # speed at which volatility decays
+        lam2  = rng.uniform(0.01,  0.20,  n_params) # speed at which volatility decays
+        rho12 = rng.uniform(-0.5,  0.5,   n_params) # correlation coefficient
+        f0_lv = rng.uniform(0.01,  0.08,  n_params) # initial forward curve *check*
+    else:
+        xi1   = rng.uniform(0.020, 0.050, n_params) # constant volatility coefficient
+        xi2   = rng.uniform(0.020, 0.050, n_params) # constant volatility coefficient
+        lam1  = rng.uniform(0.01,  0.10,  n_params) # speed at which volatility decays
+        lam2  = rng.uniform(0.01,  0.05,  n_params) # speed at which volatility decays
+        rho12 = rng.uniform(-0.95, -0.5,  n_params) # correlation coefficient
+        f0_lv = rng.uniform(0.08,  0.20,  n_params) # initial forward rate curve velocity *check*
+
+    params  = np.stack([xi1, xi2, lam1, lam2, rho12, f0_lv], axis=1)
     samples = np.zeros((n_params, n_paths, M))
-    dt = 1.0 / n_steps
+    dt      = 1.0 / n_steps
 
     for p_idx in range(n_params):
-        xi = np.array([xi1[p_idx], xi2[p_idx]])
-        lam = np.array([lam1[p_idx], lam2[p_idx]])
+        xi      = np.array([xi1[p_idx], xi2[p_idx]])   # (2,)
+        lam     = np.array([lam1[p_idx], lam2[p_idx]]) # (2,)
         rho_val = rho12[p_idx]
-        f0 = f0_lv[p_idx] * np.ones(M)
 
-        corr = np.array([[1.0, rho_val], [rho_val, 1.0]])
-        L = np.linalg.cholesky(corr)
+        # Initial forward curve: flat level + optional upward slope
+        f0 = f0_lv[p_idx] + f0_slope * maturities      # (M,)
+        # f0_1v *  rho12 + f0_slope
+        
 
-        f = np.tile(f0, (n_paths, 1))
+        # Correlation matrix R and its Cholesky factor L (dW = L @ dZ)
+        rho_c = float(np.clip(rho_val, -1.0 + 1e-7, 1.0 - 1e-7))
+        R     = np.array([[1.0, rho_c], [rho_c, 1.0]])
+        try:
+            L = np.linalg.cholesky(R)
+        except np.linalg.LinAlgError:
+            L = np.eye(2)
+
+        f = np.tile(f0, (n_paths, 1))   # (n_paths, M)
+
         for k in range(n_steps):
             t = k * dt
-            tau = np.maximum(maturities - t, 0.0)
-            sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])
-            integ = (xi[:, None] / lam[:, None]) * (1 - np.exp(-lam[:, None] * tau[None, :]))
-            alpha = np.sum(sigma * integ, axis=0)
 
-            dZ = rng.standard_normal((n_paths, 2)) * math.sqrt(dt)
-            dW = dZ @ L.T
-            diff = np.einsum("jm,pj->pm", sigma, dW)
-            f += alpha * dt + diff
+            # FIX 2: zero expired maturities so their rates stop evolving
+            active = maturities > t                          # (M,) bool
+            tau    = np.where(active, maturities - t, 0.0)  # (M,)
+
+            sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])  # (2, M)
+            sigma[:, ~active] = 0.0
+
+            integ = (xi[:, None] / lam[:, None]) * (
+                1.0 - np.exp(-lam[:, None] * tau[None, :]))              # (2, M)
+            integ[:, ~active] = 0.0
+
+            # FIX 1: full drift including off-diagonal cross terms via R
+            alpha = np.einsum("jm,jk,km->m", sigma, R, integ)           # (M,)
+
+            dZ   = rng.standard_normal((n_paths, 2)) * math.sqrt(dt)
+            dW   = dZ @ L.T                                              # (n_paths, 2)
+            diff = np.einsum("jm,pj->pm", sigma, dW)                    # (n_paths, M)
+            f   += alpha * dt + diff
 
         samples[p_idx] = f
 
@@ -680,6 +795,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Random seed (default: 42)")
     p.add_argument("--no-crisis", action="store_true",
                    help="Skip crisis-regime generation")
+    p.add_argument("--hjm-f0-slope", type=float, default=0.0,
+                   help="HJM initial curve slope in rate/year. "
+                        "f(0,T) = f0_level + slope*T. Default 0 (flat).")
+    p.add_argument("--hjm-n-factors", type=int, default=2,
+                   help="HJM number of factors (only 2 supported). Default 2.")
     return p
 
 
@@ -691,6 +811,8 @@ def _run_one(
     n_steps: int,
     grid: int,
     crisis: bool,
+    hjm_f0_slope: float = 0.0,
+    hjm_n_factors: int = 2,
 ) -> None:
     """Run single model exactly as specified."""
     # Shared grids (exact from paper)
@@ -709,7 +831,8 @@ def _run_one(
         if name == "heston":
             data = run_heston(n_params, n_paths, n_steps, log_strikes, tenors, rng, is_crisis)
         elif name == "hjm":
-            data = run_hjm(n_params, n_paths, n_steps, maturities, rng, is_crisis)
+            data = run_hjm(n_params, n_paths, n_steps, maturities, rng, is_crisis,
+                           f0_slope=hjm_f0_slope, n_factors=hjm_n_factors)
         elif name == "sabr":
             data = run_sabr(n_params, n_paths, n_steps, strikes, tenors, rng, is_crisis)
         elif name == "rough_heston":
@@ -763,6 +886,8 @@ def main() -> None:
                 n_steps=args.n_steps,
                 grid=args.grid_size,
                 crisis=not args.no_crisis,
+                hjm_f0_slope=args.hjm_f0_slope,
+                hjm_n_factors=args.hjm_n_factors,
             )
         except Exception as exc:
             print(f"  ERROR in {model_name}: {exc}")
