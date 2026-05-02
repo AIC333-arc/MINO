@@ -350,6 +350,7 @@ def run_hjm(
             active = maturities > t                          # (M,) bool
             tau    = np.where(active, maturities - t, 0.0)   # (M,)
 
+            # Brandon please check this - I searched this and it gave this impl.
             sigma = xi[:, None] * np.exp(-lam[:, None] * tau[None, :])  # (2, M)
             sigma[:, ~active] = 0.0
 
@@ -360,6 +361,7 @@ def run_hjm(
             # FIX 1: full drift including off-diagonal cross terms via R
             alpha = np.einsum("jm,jk,km->m", sigma, R, integ)           # (M,)
 
+            # This part looks fine, but I would just double check
             dZ   = rng.standard_normal((n_paths, 2)) * math.sqrt(dt)
             dW   = dZ @ L.T                                              # (n_paths, 2)
             diff = np.einsum("jm,pj->pm", sigma, dW)                    # (n_paths, M)
@@ -397,13 +399,16 @@ def _hagan_lognormal(F, K, T, alpha, beta, rho, nu):
         if abs(lf) < eps:
             z_chi = 1.0
         else:
-            z = (nu / alpha) * FK_b * lf
+            z = (nu / alpha) * FK_b * lf # good
             chi = math.log((math.sqrt(1 - 2 * rho * z + z**2) + z - rho) / (1 - rho + eps))
             z_chi = z / (chi + eps)
         A = 1 + ((1 - beta)**2 * alpha**2 / (24 * (F * k)**(1 - beta)) +
                  rho * beta * nu * alpha / (4 * FK_b) +
                  (2 - 3 * rho**2) * nu**2 / 24) * T
+    
         out[i] = (alpha / FK_b) * z_chi * A
+        # Everything is fine I just think there is an additional denominator term that is missing
+        # Refer to page 89 of https://www.deriscope.com/docs/Hagan_2002.pdf
     return out
 
 def run_sabr(
@@ -443,14 +448,17 @@ def run_sabr(
             F_paths = np.full(n_paths, F0)
             sigma_paths = np.full(n_paths, al)
 
+            # Can you spend like 2 minutes looking at this
+            # I assume µ = 0 here because if not sigma paths would be:
+            # S_t = S0*exp(µ - 0.5 * nu**2) * dt_s + nu * dWs)
             for _ in range(n_steps):
                 Z = rng.standard_normal((n_paths, 2))
                 W = Z @ L_corr.T
                 dWF = W[:, 0] * sqrt_dt
                 dWs = W[:, 1] * sqrt_dt
-                sigma_paths *= np.exp(-0.5 * nu**2 * dt_s + nu * dWs)
+                sigma_paths *= np.exp(-0.5 * nu**2 * dt_s + nu * dWs) # I think this is fine
                 F_beta = np.maximum(F_paths, 0) ** be
-                F_paths = np.maximum(F_paths + sigma_paths * F_beta * dWF, 0)
+                F_paths = np.maximum(F_paths + sigma_paths * F_beta * dWF, 0) # check this
 
             # Terminal IV via Hagan
             for path_idx in range(n_paths):
@@ -607,6 +615,8 @@ def run_reaction_diffusion(
     ky = np.fft.fftfreq(Ny, d=1.0/Ny) * 2 * math.pi
     KX, KY = np.meshgrid(kx, ky, indexing="ij")
     lap_eig = -(KX**2 + KY**2)
+    # with discrete fourier grid, does lap_eig need to be equal to:
+    # lap_eig = -[(2πn/L_X)^2 + (2πm/L_y)^2] for integers m and n
 
     for p_idx in range(n_params):
         nu, sigma, u0_mean, T = params[p_idx]
@@ -620,7 +630,15 @@ def run_reaction_diffusion(
                 noise = sigma * math.sqrt(dt) * rng.standard_normal((Nx, Ny))
                 rhs = u + reaction + noise
                 rhs_hat = np.fft.fft2(rhs)
+                # So here - this is more just for me
+                # u(x, y) --> u_hat(k_x, k_y)
+                # ∆u --> lambda_k * u_hat
+                # implicit update --> u^(n=1) = u^n + dt*v*∆u^(n+1)
+                # fourier space --> u_hat^(n=1) = u_hat^rhs + dt*v*∆u_hat^(n+1)
+                # rearrange and you get impl
                 u_hat = impl * rhs_hat
+                # periodic boundary conds
+                # our diffusion update is applied in fourier space
                 u = np.real(np.fft.ifft2(u_hat))
             samples[p_idx, path_idx] = u
 
